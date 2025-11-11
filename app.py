@@ -400,7 +400,135 @@ def delete_product(id):
 @app.route("/product/<int:product_id>")
 def product_detail(product_id):
     product = supabase.table("inventory").select("*").eq("id", product_id).single().execute().data
-    return render_template("product_detail.html", product=product)
+    
+    # Lấy reviews cho sản phẩm này
+    reviews = []
+    try:
+        print(f"🔍 Fetching reviews for product {product_id}...")
+        res_reviews = supabase.table("reviews").select("*").eq("id_product", product_id).order("id", desc=True).execute()
+        reviews = res_reviews.data or []
+        print(f"✅ Found {len(reviews)} reviews")
+    except Exception as e:
+        print(f"❌ Error fetching reviews: {str(e)}")
+        reviews = []
+    
+    # Kiểm tra xem user đã mua sản phẩm này chưa (nếu logged in)
+    user_has_purchased = False
+    user_orders = []
+    if 'email' in session:
+        try:
+            res_orders = supabase.table("orders").select("*").eq("email", session.get('email')).execute()
+            user_orders = res_orders.data or []
+            
+            # Kiểm tra nếu product_id có trong orders của user
+            for order in user_orders:
+                products_in_order = order.get('product', [])
+                if isinstance(products_in_order, str):
+                    try:
+                        products_in_order = json.loads(products_in_order)
+                    except:
+                        pass
+                
+                if isinstance(products_in_order, list):
+                    for p in products_in_order:
+                        if p.get('id') == product_id:
+                            user_has_purchased = True
+                            break
+                if user_has_purchased:
+                    break
+        except Exception as e:
+            print(f"❌ Error checking purchase history: {str(e)}")
+            pass
+    
+    return render_template("product_detail.html", product=product, reviews=reviews, user_has_purchased=user_has_purchased, user_orders=user_orders)
+
+
+# -------------------------
+# Thêm review/đánh giá
+# -------------------------
+@app.route("/add_review", methods=["POST"])
+def add_review():
+    print("\n" + "="*60)
+    print("🔍 ADD REVIEW REQUEST RECEIVED")
+    print("="*60)
+    
+    if 'email' not in session:
+        print("❌ User not logged in")
+        flash('Bạn cần đăng nhập để bình luận.')
+        return redirect(url_for('login'))
+    
+    try:
+        # Get form data
+        product_id_str = request.form.get('product_id', '0')
+        order_id = request.form.get('order_id', '')
+        rating_str = request.form.get('rating', '0')
+        comment = request.form.get('comment', '').strip()
+        
+        print(f"📋 Form data received:")
+        print(f"  product_id: {product_id_str} (type: {type(product_id_str)})")
+        print(f"  order_id: {order_id}")
+        print(f"  rating: {rating_str} (type: {type(rating_str)})")
+        print(f"  comment: {comment[:50]}..." if len(comment) > 50 else f"  comment: {comment}")
+        
+        product_id = int(product_id_str)
+        rating = int(rating_str)
+        
+        email = session.get('email', '')
+        name = session.get('name', '')
+        
+        print(f"📧 Session data:")
+        print(f"  email: {email}")
+        print(f"  name: {name}")
+        
+        # Kiểm tra dữ liệu
+        if not product_id or not rating or not comment:
+            error_msg = 'Vui lòng điền đầy đủ thông tin: Sao, bình luận.'
+            print(f"❌ {error_msg}")
+            flash(error_msg)
+            return redirect(url_for('product_detail', product_id=product_id))
+        
+        if rating < 1 or rating > 5:
+            error_msg = 'Đánh giá phải từ 1 đến 5 sao.'
+            print(f"❌ {error_msg}")
+            flash(error_msg)
+            return redirect(url_for('product_detail', product_id=product_id))
+        
+        # Chuẩn bị dữ liệu
+        review_data = {
+            "id_product": product_id,
+            "order_id": order_id if order_id else None,
+            "rating": rating,
+            "comment": comment,
+            "name": name if name else "Anonymous",
+            "email": email,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        print(f"\n� Attempting to save review:")
+        print(f"  {review_data}")
+        
+        # Try to insert
+        result = supabase.table("reviews").insert(review_data).execute()
+        
+        print(f"✅ Review saved successfully!")
+        print(f"  Result: {result}")
+        
+        flash('✅ Cảm ơn bạn đã bình luận!')
+        return redirect(url_for('product_detail', product_id=product_id))
+        
+    except Exception as e:
+        import traceback
+        error_msg = f'Lỗi khi lưu bình luận: {str(e)}'
+        print(f"❌ ERROR: {error_msg}")
+        print(f"🔴 Traceback:")
+        print(traceback.format_exc())
+        flash(error_msg)
+        try:
+            return redirect(url_for('product_detail', product_id=product_id))
+        except:
+            return redirect(url_for('index'))
+    finally:
+        print("="*60 + "\n")
 
 
 # -------------------------
