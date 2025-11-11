@@ -455,7 +455,7 @@ def product_detail(product_id):
             pass
     
     return render_template("product_detail.html", product=product, reviews=reviews, user_has_purchased=user_has_purchased, user_orders=user_orders)
-
+      
 
 # -------------------------
 # Thêm review/đánh giá
