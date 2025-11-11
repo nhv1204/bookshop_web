@@ -53,11 +53,6 @@ app.config.update(
 )
 Session(app)
 
-# ✅ Make session available in all Jinja templates
-@app.context_processor
-def inject_session():
-    return dict(session=session)
-
 UPLOAD_FOLDER = "static/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -291,8 +286,17 @@ def admin():
 
 @app.route("/admin/product")
 def product():
+    search = request.args.get("search", "").strip().lower()
     res = supabase.table("inventory").select("*").order("id", desc=False).execute()
     products = res.data or []
+
+    if search:
+        products = [
+            p for p in products
+            if search in (p.get("product") or "").lower()
+            or search in (p.get("author") or "").lower()
+        ]
+
     msg = request.args.get("msg")
     return render_template("admin/product.html", products=products, msg=msg)
 # -------------------------
@@ -301,6 +305,8 @@ def product():
 import time
 import os
 from werkzeug.utils import secure_filename
+
+
 
 @app.route("/admin/add", methods=["GET", "POST"])
 def add_product():
@@ -347,6 +353,7 @@ def add_product():
 # -------------------------
 #  Sửa sản phẩm
 # -------------------------
+
 @app.route("/admin/edit/<int:id>", methods=["GET", "POST"])
 def edit_product(id):
     types = supabase.table("type_book").select("*").execute().data or []
@@ -358,17 +365,24 @@ def edit_product(id):
         author = request.form.get("author")
         description = request.form.get("description")
         book_type = request.form.get("type")
+        image_url = request.form.get("old_image_url")  # giữ ảnh cũ nếu không đổi
+
         file = request.files.get("image_file")
-        image_url = request.form.get("old_image_url")
-
         if file and file.filename:
+            # ✅ Tạo tên file unique
             filename = f"{uuid.uuid4().hex}_{secure_filename(file.filename)}"
-            path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            file.save(path)
-            with open(path, "rb") as f:
-                supabase.storage.from_("product-images").upload(filename, f)
-            image_url = f"{SUPABASE_URL}/storage/v1/object/public/product-images/{filename}"
 
+            # ✅ Upload trực tiếp lên Supabase Storage
+            try:
+                supabase.storage.from_("product-images").upload(
+                    filename, file.read()
+                )
+                image_url = f"{SUPABASE_URL}/storage/v1/object/public/product-images/{filename}"
+            except Exception as e:
+                print("❌ Upload ảnh thất bại:", e)
+                return "Lỗi upload ảnh!", 500
+
+        # ✅ Cập nhật sản phẩm
         supabase.table("inventory").update({
             "product": product,
             "price": price,
@@ -379,7 +393,7 @@ def edit_product(id):
             "image_url": image_url
         }).eq("id", id).execute()
 
-        return redirect(url_for("admin", msg="📝 Cập nhật sản phẩm thành công!"))
+        return redirect(url_for("admin", msg="✅ Cập nhật sản phẩm thành công!"))
 
     product = supabase.table("inventory").select("*").eq("id", id).single().execute().data
     return render_template("admin/edit_product.html", product=product, types=types)
@@ -768,6 +782,74 @@ def update_order_status(order_id):
     supabase.table("orders").update({"status": "accept"}).eq("order_id", order_id).execute()
 
     return redirect(url_for("admin_orders"))
+# -------------------------
+#  Quản lý thể loại
+# -------------------------
+@app.route("/admin/type")
+def admin_type():
+    res = supabase.table("type_book").select("*").order("id", desc=False).execute()
+    types = res.data or []
+    msg = request.args.get("msg")
+    return render_template("admin/type.html", types=types, msg=msg)
+@app.route("/admin/type/add", methods=["POST"])
+def add_type():
+    name = request.form.get("name")
+    if name:
+        supabase.table("type_book").insert({"name": name}).execute()
+        return redirect(url_for("admin_type", msg="✅ Thêm thể loại thành công!"))
+    return redirect(url_for("admin_type", msg="⚠️ Tên thể loại không được để trống!"))
+
+@app.route("/admin/type/edit/<int:id>", methods=["GET", "POST"])
+def edit_type(id):
+    # Nếu form được gửi lên
+    if request.method == "POST":
+        new_name = request.form.get("name")
+        if new_name:
+            supabase.table("type_book").update({"name": new_name}).eq("id", id).execute()
+            return redirect(url_for("admin_type", msg="📝 Cập nhật thể loại thành công!"))
+        return redirect(url_for("admin_type", msg="⚠️ Tên thể loại không được để trống!"))
+
+    # Lấy dữ liệu cũ để hiển thị trong form sửa
+    t = supabase.table("type_book").select("*").eq("id", id).single().execute().data
+    return render_template("admin/edit_type.html", type_item=t)
+
+
+@app.route("/admin/type/delete/<int:id>")
+def delete_type(id):
+    supabase.table("type_book").delete().eq("id", id).execute()
+    return redirect(url_for("admin_type", msg="🗑️ Xóa thể loại thành công!"))
+
+@app.route("/admin/stats")
+def admin_stats():
+    # Tổng sản phẩm
+    total_products = len(supabase.table("inventory").select("id").execute().data or [])
+
+    # Tổng đơn hàng
+    total_orders = len(supabase.table("orders").select("id").execute().data or [])
+
+    # Tổng doanh thu từ đơn hàng đã duyệt
+    accepted_orders = supabase.table("orders").select("total_amount").eq("status", "accept").execute().data or []
+    total_revenue = sum(o.get("total_amount", 0) for o in accepted_orders)
+
+    # Top 5 sản phẩm bán chạy
+    all_orders = supabase.table("orders").select("product").eq("status", "accept").execute().data or []
+    sales_count = {}
+    for order in all_orders:
+        products = order.get("product")
+        if isinstance(products, str):
+            products = json.loads(products)
+        for p in products:
+            name = p.get("name")
+            qty = p.get("quantity", 0)
+            sales_count[name] = sales_count.get(name, 0) + qty
+
+    top_selling = sorted(sales_count.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return render_template("admin/stats.html",
+                           total_products=total_products,
+                           total_orders=total_orders,
+                           total_revenue=total_revenue,
+                           top_selling=top_selling)
 
 
 if __name__ == "__main__":
