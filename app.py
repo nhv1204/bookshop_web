@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 from supabase import create_client
 from werkzeug.utils import secure_filename
 
@@ -10,6 +10,13 @@ import random
 from datetime import datetime
 import json
 app = Flask(__name__)
+
+# -------------------------
+# Make session available in all Jinja templates
+# -------------------------
+@app.context_processor
+def inject_session():
+    return dict(session=session)
 
 # -------------------------
 # Supabase setup
@@ -24,6 +31,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 SESSION_DIR = os.path.join(os.getcwd(), ".flask_session")
 os.makedirs(SESSION_DIR, exist_ok=True)
 
+try:
+    for _f in os.listdir(SESSION_DIR):
+        p = os.path.join(SESSION_DIR, _f)
+        if os.path.isfile(p):
+            os.remove(p)
+except Exception as _e:
+    # Non-fatal: if we can't clear sessions just continue
+    print('Warning: could not clear session store on startup:', _e)
+
 app.secret_key = "supersecretkey"
 app.config.update(
     SESSION_TYPE="filesystem",
@@ -37,15 +53,117 @@ app.config.update(
 )
 Session(app)
 
+# ✅ Make session available in all Jinja templates
+@app.context_processor
+def inject_session():
+    return dict(session=session)
+
 UPLOAD_FOLDER = "static/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
+
 # -------------------------
-# Trang chủ
+#  Decorator login_required
+# -------------------------
+from functools import wraps
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Bạn cần đăng nhập để truy cập trang này.')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# -------------------------
+#  Đăng nhập đăng ký (render chung 'login_register.html')
+# -------------------------
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        name = request.form.get('name', '')
+        phone = request.form.get('phone', '')
+
+        try:
+            # Đăng ký với Supabase Auth
+            res = supabase.auth.sign_up({"email": email, "password": password})
+            if res.user:
+                user_id = res.user.id
+                
+                # Kiểm tra duplicate email trong bảng customer
+                existing_customer = supabase.table("customer").select("*").eq("email", email).execute()
+                if not existing_customer.data:
+                    # Insert vào bảng customer (name, email, phone)
+                    supabase.table("customer").insert({
+                        "name": name,
+                        "email": email,
+                        "phone": phone
+                    }).execute()
+                
+                # Không set session ngay vì cần xác nhận email, chỉ flash thông báo
+                flash('Đăng ký thành công! Vui lòng kiểm tra email để xác nhận.')
+                return redirect(url_for('login'))
+            else:
+                flash('Đăng ký thất bại. Email có thể đã tồn tại.')
+                return render_template('login_register.html')
+        except Exception as e:
+            flash(f'Lỗi đăng ký: {str(e)}')
+            return render_template('login_register.html')
+
+    return render_template('login_register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        try:
+            # Kiểm tra mật khẩu từ bảng customer (cột password)
+            res_customer = supabase.table("customer").select("*").eq("email", email).single().execute()
+            customer = res_customer.data
+
+            # So sánh mật khẩu nhập vào với mật khẩu lưu trong cơ sở dữ liệu
+            if customer and customer.get('password') == password:
+                # Lưu user info vào session
+                session['user_id'] = customer.get('id') or email
+                session['email'] = email
+                session['name'] = customer.get('name', '')
+                session['phone'] = customer.get('phone', '')
+                flash('Đăng nhập thành công!')
+                return redirect(url_for('index'))
+            else:
+                flash('Email hoặc mật khẩu không đúng!')
+                return render_template('login_register.html')
+        except Exception as e:
+            flash(f'Lỗi đăng nhập: {str(e)}')
+            return render_template('login_register.html')
+    
+    # GET: Hiển thị form (mặc định panel đăng nhập)
+    return render_template('login_register.html')
+
+@app.route('/logout')
+def logout():
+    try:
+        supabase.auth.sign_out()
+    except:
+        pass
+    session.clear()
+    flash('Đăng xuất thành công.')
+    return redirect(url_for('login'))
+
+# -------------------------
+# Trang chủ (MERGED: Kết hợp logic search + login_required)
 # -------------------------
 @app.route("/")
 def index():
+    # If user is not logged in, redirect to the login page
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
     search_query = request.args.get("search", "").strip()
     filter_type = request.args.get("type", "")
     price_min = float(request.args.get("min", 0) or 0)
@@ -89,6 +207,8 @@ def index():
         price_max=price_max,
         page=page,
         total_pages=total_pages,
+        session=session,
+        cart_count=len(session.get('cart', [])),
     )
 
 
@@ -111,6 +231,53 @@ def order(product_id):
 
     return render_template("order.html", product=product)
 
+# -------------------------
+# Trang profile
+# -------------------------
+@app.route('/profile')
+def profile():
+    # Require login
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    email = session.get('email')
+    # Lấy thông tin customer
+    try:
+        res_customer = supabase.table('customer').select('*').eq('email', email).single().execute()
+        customer = res_customer.data
+    except Exception:
+        customer = None
+
+    # Lấy đơn hàng của user (cột product có thể là JSON)
+    try:
+        res_orders = supabase.table('orders').select('*').eq('email', email).order('id', desc=True).execute()
+        orders = res_orders.data or []
+    except Exception:
+        orders = []
+
+    # Lấy tất cả sản phẩm từ inventory để mapping ảnh
+    try:
+        res_inventory = supabase.table('inventory').select('id, product, image_url').execute()
+        inventory_map = {p['id']: p for p in (res_inventory.data or [])}
+    except Exception:
+        inventory_map = {}
+
+    # Parse product field if stored as string và thêm image_url
+    for o in orders:
+        if isinstance(o.get('product'), str):
+            try:
+                o['product'] = json.loads(o['product'])
+            except Exception:
+                pass
+        
+        # Thêm image_url cho từng product trong đơn hàng
+        if isinstance(o.get('product'), list):
+            for item in o['product']:
+                product_id = item.get('id')
+                if product_id and product_id in inventory_map:
+                    item['image_url'] = inventory_map[product_id].get('image_url', '')
+
+    return render_template('profile.html', customer=customer, orders=orders)
 
 # -------------------------
 # Trang admin
@@ -388,12 +555,6 @@ def process_checkout():
         if not exists.data:
             break
 
-    # # Trừ số lượng tồn kho
-    # for item in items:
-    #     current = supabase.table("inventory").select("quantity").eq("id", item["id"]).single().execute()
-    #     new_qty = max(0, current.data["quantity"] - item["quantity"])
-    #     supabase.table("inventory").update({"quantity": new_qty}).eq("id", item["id"]).execute()
-
     # Lưu đơn hàng vào Supabase (cột product phải là JSONB)
     supabase.table("orders").insert({
         "order_id": order_id,
@@ -445,7 +606,7 @@ def admin_order_detail(order_id):
     order = res.data
 
     if order and isinstance(order.get("product"), str):
-        order["product"] = json.loads(order["product"])  # chuyển từ string JSON sang list
+        order["product"] = json.loads(order["product"])
 
     return render_template("admin/order_detail.html", order=order)
 
@@ -480,8 +641,6 @@ def update_order_status(order_id):
 
     return redirect(url_for("admin_orders"))
 
-# -------------------------
-#  Run
-# -------------------------
+
 if __name__ == "__main__":
     app.run(debug=True)
